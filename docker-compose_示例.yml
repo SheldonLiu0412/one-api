@@ -1,0 +1,31 @@
+version: '3'
+
+services:
+  nextjs-zhufu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zhufu
+    environment:
+      - AIHUBMIX_API_KEY=${AIHUBMIX_API_KEY}
+      - AIHUBMIX_API_URL=${AIHUBMIX_API_URL}
+      - AIHUBMIX_MODEL=${AIHUBMIX_MODEL}
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      # HTTPS 路由
+      - "traefik.http.routers.zhufu.rule=Host(`zhufu.me`)"
+      - "traefik.http.routers.zhufu.entrypoints=websecure"
+      - "traefik.http.routers.zhufu.tls.certresolver=letsencrypt"
+      - "traefik.http.services.zhufu.loadbalancer.server.port=3001"
+      # HTTP 路由和重定向
+      - "traefik.http.routers.zhufu-http.rule=Host(`zhufu.me`)"
+      - "traefik.http.routers.zhufu-http.entrypoints=web"
+      - "traefik.http.routers.zhufu-http.middlewares=https-redirect"
+      - "traefik.http.middlewares.https-redirect.redirectscheme.scheme=https"
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
