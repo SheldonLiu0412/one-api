@@ -1,450 +1,816 @@
-package model
+package controller
 
 import (
-	"errors"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-gonic/gin"
+
 	"github.com/songquanpeng/one-api/common"
-	"github.com/songquanpeng/one-api/common/blacklist"
 	"github.com/songquanpeng/one-api/common/config"
-	"github.com/songquanpeng/one-api/common/helper"
-	"github.com/songquanpeng/one-api/common/logger"
+	"github.com/songquanpeng/one-api/common/ctxkey"
+	"github.com/songquanpeng/one-api/common/i18n"
 	"github.com/songquanpeng/one-api/common/random"
-	"gorm.io/gorm"
-	"strings"
+	"github.com/songquanpeng/one-api/model"
 )
 
-const (
-	RoleGuestUser  = 0
-	RoleCommonUser = 1
-	RoleAdminUser  = 10
-	RoleRootUser   = 100
-)
-
-const (
-	UserStatusEnabled  = 1 // don't use 0, 0 is the default value!
-	UserStatusDisabled = 2 // also don't use 0
-	UserStatusDeleted  = 3
-)
-
-// User if you add sensitive fields, don't forget to clean them in setupLogin function.
-// Otherwise, the sensitive information will be saved on local storage in plain text!
-type User struct {
-	Id               int    `json:"id"`
-	Username         string `json:"username" gorm:"unique;index" validate:"max=12"`
-	Password         string `json:"password" gorm:"not null;" validate:"min=8,max=20"`
-	DisplayName      string `json:"display_name" gorm:"index" validate:"max=20"`
-	Role             int    `json:"role" gorm:"type:int;default:1"`   // admin, util
-	Status           int    `json:"status" gorm:"type:int;default:1"` // enabled, disabled
-	Email            string `json:"email" gorm:"index" validate:"max=50"`
-	GitHubId         string `json:"github_id" gorm:"column:github_id;index"`
-	WeChatId         string `json:"wechat_id" gorm:"column:wechat_id;index"`
-	LarkId           string `json:"lark_id" gorm:"column:lark_id;index"`
-	OidcId           string `json:"oidc_id" gorm:"column:oidc_id;index"`
-	VerificationCode string `json:"verification_code" gorm:"-:all"`                                    // this field is only for Email verification, don't save it to database!
-	AccessToken      string `json:"access_token" gorm:"type:char(32);column:access_token;uniqueIndex"` // this token is for system management
-	Quota            int64  `json:"quota" gorm:"bigint;default:0"`
-	UsedQuota        int64  `json:"used_quota" gorm:"bigint;default:0;column:used_quota"` // used quota
-	RequestCount     int    `json:"request_count" gorm:"type:int;default:0;"`             // request number
-	Group            string `json:"group" gorm:"type:varchar(32);default:'default'"`
-	AffCode          string `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
-	InviterId        int    `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
-func GetMaxUserId() int {
-	var user User
-	DB.Last(&user)
-	return user.Id
-}
-
-func GetAllUsers(startIdx int, num int, order string) (users []*User, err error) {
-	query := DB.Limit(num).Offset(startIdx).Omit("password").Where("status != ?", UserStatusDeleted)
-
-	switch order {
-	case "quota":
-		query = query.Order("quota desc")
-	case "used_quota":
-		query = query.Order("used_quota desc")
-	case "request_count":
-		query = query.Order("request_count desc")
-	default:
-		query = query.Order("id desc")
-	}
-
-	err = query.Find(&users).Error
-	return users, err
-}
-
-func SearchUsers(keyword string) (users []*User, err error) {
-	if !common.UsingPostgreSQL {
-		err = DB.Omit("password").Where("id = ? or username LIKE ? or email LIKE ? or display_name LIKE ?", keyword, keyword+"%", keyword+"%", keyword+"%").Find(&users).Error
-	} else {
-		err = DB.Omit("password").Where("username LIKE ? or email LIKE ? or display_name LIKE ?", keyword+"%", keyword+"%", keyword+"%").Find(&users).Error
-	}
-	return users, err
-}
-
-func GetUserById(id int, selectAll bool) (*User, error) {
-	if id == 0 {
-		return nil, errors.New("id 为空！")
-	}
-	user := User{Id: id}
-	var err error = nil
-	if selectAll {
-		err = DB.First(&user, "id = ?", id).Error
-	} else {
-		err = DB.Omit("password").First(&user, "id = ?", id).Error
-	}
-	return &user, err
-}
-
-func GetUserIdByAffCode(affCode string) (int, error) {
-	if affCode == "" {
-		return 0, errors.New("affCode 为空！")
-	}
-	var user User
-	err := DB.Select("id").First(&user, "aff_code = ?", affCode).Error
-	return user.Id, err
-}
-
-func DeleteUserById(id int) (err error) {
-	if id == 0 {
-		return errors.New("id 为空！")
-	}
-	user := User{Id: id}
-	return user.Delete()
-}
-
-func (user *User) Insert(inviterId int) error {
-	var err error
-	if user.Password != "" {
-		user.Password, err = common.Password2Hash(user.Password)
-		if err != nil {
-			return err
-		}
-	}
-	user.Quota = config.QuotaForNewUser
-	user.AccessToken = random.GetUUID()
-	user.AffCode = random.GetRandomString(4)
-	result := DB.Create(user)
-	if result.Error != nil {
-		return result.Error
-	}
-	if config.QuotaForNewUser > 0 {
-		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", common.LogQuota(config.QuotaForNewUser)))
-	}
-	if inviterId != 0 {
-		if config.QuotaForInvitee > 0 {
-			_ = IncreaseUserQuota(user.Id, config.QuotaForInvitee)
-			RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", common.LogQuota(config.QuotaForInvitee)))
-		}
-		if config.QuotaForInviter > 0 {
-			_ = IncreaseUserQuota(inviterId, config.QuotaForInviter)
-			RecordLog(inviterId, LogTypeSystem, fmt.Sprintf("邀请用户赠送 %s", common.LogQuota(config.QuotaForInviter)))
-		}
-	}
-	// create default token
-	cleanToken := Token{
-		UserId:         user.Id,
-		Name:           "default",
-		Key:            random.GenerateKey(),
-		CreatedTime:    helper.GetTimestamp(),
-		AccessedTime:   helper.GetTimestamp(),
-		ExpiredTime:    -1,
-		RemainQuota:    -1,
-		UnlimitedQuota: true,
-	}
-	result.Error = cleanToken.Insert()
-	if result.Error != nil {
-		// do not block
-		logger.SysError(fmt.Sprintf("create default token for user %d failed: %s", user.Id, result.Error.Error()))
-	}
-	return nil
-}
-
-func (user *User) Update(updatePassword bool) error {
-	var err error
-	if updatePassword {
-		user.Password, err = common.Password2Hash(user.Password)
-		if err != nil {
-			return err
-		}
-	}
-	if user.Status == UserStatusDisabled {
-		blacklist.BanUser(user.Id)
-	} else if user.Status == UserStatusEnabled {
-		blacklist.UnbanUser(user.Id)
-	}
-	err = DB.Model(user).Updates(user).Error
-	return err
-}
-
-func (user *User) Delete() error {
-	if user.Id == 0 {
-		return errors.New("id 为空！")
-	}
-	blacklist.BanUser(user.Id)
-	user.Username = fmt.Sprintf("deleted_%s", random.GetUUID())
-	user.Status = UserStatusDeleted
-	err := DB.Model(user).Updates(user).Error
-	return err
-}
-
-// ValidateAndFill check password & user status
-func (user *User) ValidateAndFill() (err error) {
-	// When querying with struct, GORM will only query with non-zero fields,
-	// that means if your field’s value is 0, '', false or other zero values,
-	// it won’t be used to build query conditions
-	password := user.Password
-	if user.Username == "" || password == "" {
-		return errors.New("用户名或密码为空")
-	}
-	err = DB.Where("username = ?", user.Username).First(user).Error
-	if err != nil {
-		// we must make sure check username firstly
-		// consider this case: a malicious user set his username as other's email
-		err := DB.Where("email = ?", user.Username).First(user).Error
-		if err != nil {
-			return errors.New("用户名或密码错误，或用户已被封禁")
-		}
-	}
-	okay := common.ValidatePasswordAndHash(password, user.Password)
-	if !okay || user.Status != UserStatusEnabled {
-		return errors.New("用户名或密码错误，或用户已被封禁")
-	}
-	return nil
-}
-
-func (user *User) FillUserById() error {
-	if user.Id == 0 {
-		return errors.New("id 为空！")
-	}
-	DB.Where(User{Id: user.Id}).First(user)
-	return nil
-}
-
-func (user *User) FillUserByEmail() error {
-	if user.Email == "" {
-		return errors.New("email 为空！")
-	}
-	DB.Where(User{Email: user.Email}).First(user)
-	return nil
-}
-
-func (user *User) FillUserByGitHubId() error {
-	if user.GitHubId == "" {
-		return errors.New("GitHub id 为空！")
-	}
-	DB.Where(User{GitHubId: user.GitHubId}).First(user)
-	return nil
-}
-
-func (user *User) FillUserByLarkId() error {
-	if user.LarkId == "" {
-		return errors.New("lark id 为空！")
-	}
-	DB.Where(User{LarkId: user.LarkId}).First(user)
-	return nil
-}
-
-func (user *User) FillUserByOidcId() error {
-	if user.OidcId == "" {
-		return errors.New("oidc id 为空！")
-	}
-	DB.Where(User{OidcId: user.OidcId}).First(user)
-	return nil
-}
-
-func (user *User) FillUserByWeChatId() error {
-	if user.WeChatId == "" {
-		return errors.New("WeChat id 为空！")
-	}
-	DB.Where(User{WeChatId: user.WeChatId}).First(user)
-	return nil
-}
-
-func (user *User) FillUserByUsername() error {
-	if user.Username == "" {
-		return errors.New("username 为空！")
-	}
-	DB.Where(User{Username: user.Username}).First(user)
-	return nil
-}
-
-func IsEmailAlreadyTaken(email string) bool {
-	return DB.Where("email = ?", email).Find(&User{}).RowsAffected == 1
-}
-
-func IsWeChatIdAlreadyTaken(wechatId string) bool {
-	return DB.Where("wechat_id = ?", wechatId).Find(&User{}).RowsAffected == 1
-}
-
-func IsGitHubIdAlreadyTaken(githubId string) bool {
-	return DB.Where("github_id = ?", githubId).Find(&User{}).RowsAffected == 1
-}
-
-func IsLarkIdAlreadyTaken(githubId string) bool {
-	return DB.Where("lark_id = ?", githubId).Find(&User{}).RowsAffected == 1
-}
-
-func IsOidcIdAlreadyTaken(oidcId string) bool {
-	return DB.Where("oidc_id = ?", oidcId).Find(&User{}).RowsAffected == 1
-}
-
-func IsUsernameAlreadyTaken(username string) bool {
-	return DB.Where("username = ?", username).Find(&User{}).RowsAffected == 1
-}
-
-func ResetUserPasswordByEmail(email string, password string) error {
-	if email == "" || password == "" {
-		return errors.New("邮箱地址或密码为空！")
-	}
-	hashedPassword, err := common.Password2Hash(password)
-	if err != nil {
-		return err
-	}
-	err = DB.Model(&User{}).Where("email = ?", email).Update("password", hashedPassword).Error
-	return err
-}
-
-func IsAdmin(userId int) bool {
-	if userId == 0 {
-		return false
-	}
-	var user User
-	err := DB.Where("id = ?", userId).Select("role").Find(&user).Error
-	if err != nil {
-		logger.SysError("no such user " + err.Error())
-		return false
-	}
-	return user.Role >= RoleAdminUser
-}
-
-func IsUserEnabled(userId int) (bool, error) {
-	if userId == 0 {
-		return false, errors.New("user id is empty")
-	}
-	var user User
-	err := DB.Where("id = ?", userId).Select("status").Find(&user).Error
-	if err != nil {
-		return false, err
-	}
-	return user.Status == UserStatusEnabled, nil
-}
-
-func ValidateAccessToken(token string) (user *User) {
-	if token == "" {
-		return nil
-	}
-	token = strings.Replace(token, "Bearer ", "", 1)
-	user = &User{}
-	if DB.Where("access_token = ?", token).First(user).RowsAffected == 1 {
-		return user
-	}
-	return nil
-}
-
-func GetUserQuota(id int) (quota int64, err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Select("quota").Find(&quota).Error
-	return quota, err
-}
-
-func GetUserUsedQuota(id int) (quota int64, err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Select("used_quota").Find(&quota).Error
-	return quota, err
-}
-
-func GetUserEmail(id int) (email string, err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Select("email").Find(&email).Error
-	return email, err
-}
-
-func GetUserGroup(id int) (group string, err error) {
-	groupCol := "`group`"
-	if common.UsingPostgreSQL {
-		groupCol = `"group"`
-	}
-
-	err = DB.Model(&User{}).Where("id = ?", id).Select(groupCol).Find(&group).Error
-	return group, err
-}
-
-func IncreaseUserQuota(id int, quota int64) (err error) {
-	if quota < 0 {
-		return errors.New("quota 不能为负数！")
-	}
-	if config.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
-		return nil
-	}
-	return increaseUserQuota(id, quota)
-}
-
-func increaseUserQuota(id int, quota int64) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota + ?", quota)).Error
-	return err
-}
-
-func DecreaseUserQuota(id int, quota int64) (err error) {
-	if quota < 0 {
-		return errors.New("quota 不能为负数！")
-	}
-	if config.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
-		return nil
-	}
-	return decreaseUserQuota(id, quota)
-}
-
-func decreaseUserQuota(id int, quota int64) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota - ?", quota)).Error
-	return err
-}
-
-func GetRootUserEmail() (email string) {
-	DB.Model(&User{}).Where("role = ?", RoleRootUser).Select("email").Find(&email)
-	return email
-}
-
-func UpdateUserUsedQuotaAndRequestCount(id int, quota int64) {
-	if config.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUsedQuota, id, quota)
-		addNewRecord(BatchUpdateTypeRequestCount, id, 1)
+func Login(c *gin.Context) {
+	if !config.PasswordLoginEnabled {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "管理员关闭了密码登录",
+			"success": false,
+		})
 		return
 	}
-	updateUserUsedQuotaAndRequestCount(id, quota, 1)
+	var loginRequest LoginRequest
+	err := json.NewDecoder(c.Request.Body).Decode(&loginRequest)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"message": i18n.Translate(c, "invalid_parameter"),
+			"success": false,
+		})
+		return
+	}
+	username := loginRequest.Username
+	password := loginRequest.Password
+	if username == "" || password == "" {
+		c.JSON(http.StatusOK, gin.H{
+			"message": i18n.Translate(c, "invalid_parameter"),
+			"success": false,
+		})
+		return
+	}
+	user := model.User{
+		Username: username,
+		Password: password,
+	}
+	err = user.ValidateAndFill()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"message": err.Error(),
+			"success": false,
+		})
+		return
+	}
+	SetupLogin(&user, c)
 }
 
-func updateUserUsedQuotaAndRequestCount(id int, quota int64, count int) {
-	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
-			"used_quota":    gorm.Expr("used_quota + ?", quota),
-			"request_count": gorm.Expr("request_count + ?", count),
-		},
-	).Error
+// setup session & cookies and then return user info
+func SetupLogin(user *model.User, c *gin.Context) {
+	session := sessions.Default(c)
+	session.Set("id", user.Id)
+	session.Set("username", user.Username)
+	session.Set("role", user.Role)
+	session.Set("status", user.Status)
+	err := session.Save()
 	if err != nil {
-		logger.SysError("failed to update user used quota and request count: " + err.Error())
+		c.JSON(http.StatusOK, gin.H{
+			"message": "无法保存会话信息，请重试",
+			"success": false,
+		})
+		return
+	}
+	cleanUser := model.User{
+		Id:          user.Id,
+		Username:    user.Username,
+		DisplayName: user.DisplayName,
+		Role:        user.Role,
+		Status:      user.Status,
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": "",
+		"success": true,
+		"data":    cleanUser,
+	})
+}
+
+func Logout(c *gin.Context) {
+	session := sessions.Default(c)
+	session.Clear()
+	err := session.Save()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"message": err.Error(),
+			"success": false,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": "",
+		"success": true,
+	})
+}
+
+func Register(c *gin.Context) {
+	ctx := c.Request.Context()
+	if !config.RegisterEnabled {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "管理员关闭了新用户注册",
+			"success": false,
+		})
+		return
+	}
+	if !config.PasswordRegisterEnabled {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "管理员关闭了通过密码进行注册，请使用第三方账户验证的形式进行注册",
+			"success": false,
+		})
+		return
+	}
+	var user model.User
+	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": i18n.Translate(c, "invalid_parameter"),
+		})
+		return
+	}
+	if err := common.Validate.Struct(&user); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": i18n.Translate(c, "invalid_input"),
+		})
+		return
+	}
+	if config.EmailVerificationEnabled {
+		if user.Email == "" || user.VerificationCode == "" {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "管理员开启了邮箱验证，请输入邮箱地址和验证码",
+			})
+			return
+		}
+		if !common.VerifyCodeWithKey(user.Email, user.VerificationCode, common.EmailVerificationPurpose) {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "验证码错误或已过期",
+			})
+			return
+		}
+	}
+	affCode := user.AffCode // this code is the inviter's code, not the user's own code
+	inviterId, _ := model.GetUserIdByAffCode(affCode)
+	cleanUser := model.User{
+		Username:    user.Username,
+		Password:    user.Password,
+		DisplayName: user.Username,
+		InviterId:   inviterId,
+	}
+	if config.EmailVerificationEnabled {
+		cleanUser.Email = user.Email
+	}
+	if err := cleanUser.Insert(ctx, inviterId); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+	})
+	return
+}
+
+func GetAllUsers(c *gin.Context) {
+	p, _ := strconv.Atoi(c.Query("p"))
+	if p < 0 {
+		p = 0
+	}
+
+	order := c.DefaultQuery("order", "")
+	users, err := model.GetAllUsers(p*config.ItemsPerPage, config.ItemsPerPage, order)
+
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    users,
+	})
+}
+
+func SearchUsers(c *gin.Context) {
+	keyword := c.Query("keyword")
+	users, err := model.SearchUsers(keyword)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    users,
+	})
+	return
+}
+
+func GetUser(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	user, err := model.GetUserById(id, false)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	myRole := c.GetInt(ctxkey.Role)
+	if myRole <= user.Role && myRole != model.RoleRootUser {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "无权获取同级或更高等级用户的信息",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    user,
+	})
+	return
+}
+
+func GetUserDashboard(c *gin.Context) {
+	id := c.GetInt(ctxkey.Id)
+	now := time.Now()
+	startOfDay := now.Truncate(24*time.Hour).AddDate(0, 0, -6).Unix()
+	endOfDay := now.Truncate(24 * time.Hour).Add(24*time.Hour - time.Second).Unix()
+
+	dashboards, err := model.SearchLogsByDayAndModel(id, int(startOfDay), int(endOfDay))
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "无法获取统计信息",
+			"data":    nil,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    dashboards,
+	})
+	return
+}
+
+func GenerateAccessToken(c *gin.Context) {
+	id := c.GetInt(ctxkey.Id)
+	user, err := model.GetUserById(id, true)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	user.AccessToken = random.GetUUID()
+
+	if model.DB.Where("access_token = ?", user.AccessToken).First(user).RowsAffected != 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "请重试，系统生成的 UUID 竟然重复了！",
+		})
+		return
+	}
+
+	if err := user.Update(false); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    user.AccessToken,
+	})
+	return
+}
+
+func GetAffCode(c *gin.Context) {
+	id := c.GetInt(ctxkey.Id)
+	user, err := model.GetUserById(id, true)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	if user.AffCode == "" {
+		user.AffCode = random.GetRandomString(4)
+		if err := user.Update(false); err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    user.AffCode,
+	})
+	return
+}
+
+func GetSelf(c *gin.Context) {
+	id := c.GetInt(ctxkey.Id)
+	user, err := model.GetUserById(id, false)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    user,
+	})
+	return
+}
+
+func UpdateUser(c *gin.Context) {
+	ctx := c.Request.Context()
+	var updatedUser model.User
+	err := json.NewDecoder(c.Request.Body).Decode(&updatedUser)
+	if err != nil || updatedUser.Id == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": i18n.Translate(c, "invalid_parameter"),
+		})
+		return
+	}
+	if updatedUser.Password == "" {
+		updatedUser.Password = "$I_LOVE_U" // make Validator happy :)
+	}
+	if err := common.Validate.Struct(&updatedUser); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": i18n.Translate(c, "invalid_input"),
+		})
+		return
+	}
+	originUser, err := model.GetUserById(updatedUser.Id, false)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	myRole := c.GetInt(ctxkey.Role)
+	if myRole <= originUser.Role && myRole != model.RoleRootUser {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "无权更新同权限等级或更高权限等级的用户信息",
+		})
+		return
+	}
+	if myRole <= updatedUser.Role && myRole != model.RoleRootUser {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "无权将其他用户权限等级提升到大于等于自己的权限等级",
+		})
+		return
+	}
+	if updatedUser.Password == "$I_LOVE_U" {
+		updatedUser.Password = "" // rollback to what it should be
+	}
+	updatePassword := updatedUser.Password != ""
+	if err := updatedUser.Update(updatePassword); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	if originUser.Quota != updatedUser.Quota {
+		model.RecordLog(ctx, originUser.Id, model.LogTypeManage, fmt.Sprintf("管理员将用户额度从 %s修改为 %s", common.LogQuota(originUser.Quota), common.LogQuota(updatedUser.Quota)))
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+	})
+	return
+}
+
+func UpdateSelf(c *gin.Context) {
+	var user model.User
+	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": i18n.Translate(c, "invalid_parameter"),
+		})
+		return
+	}
+	if user.Password == "" {
+		user.Password = "$I_LOVE_U" // make Validator happy :)
+	}
+	if err := common.Validate.Struct(&user); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "输入不合法 " + err.Error(),
+		})
+		return
+	}
+
+	cleanUser := model.User{
+		Id:          c.GetInt(ctxkey.Id),
+		Username:    user.Username,
+		Password:    user.Password,
+		DisplayName: user.DisplayName,
+	}
+	if user.Password == "$I_LOVE_U" {
+		user.Password = "" // rollback to what it should be
+		cleanUser.Password = ""
+	}
+	updatePassword := user.Password != ""
+	if err := cleanUser.Update(updatePassword); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+	})
+	return
+}
+
+func DeleteUser(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	originUser, err := model.GetUserById(id, false)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	myRole := c.GetInt("role")
+	if myRole <= originUser.Role {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "无权删除同权限等级或更高权限等级的用户",
+		})
+		return
+	}
+	err = model.DeleteUserById(id)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "",
+		})
+		return
 	}
 }
 
-func updateUserUsedQuota(id int, quota int64) {
-	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
-			"used_quota": gorm.Expr("used_quota + ?", quota),
-		},
-	).Error
-	if err != nil {
-		logger.SysError("failed to update user used quota: " + err.Error())
+func DeleteSelf(c *gin.Context) {
+	id := c.GetInt("id")
+	user, _ := model.GetUserById(id, false)
+
+	if user.Role == model.RoleRootUser {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "不能删除超级管理员账户",
+		})
+		return
 	}
+
+	err := model.DeleteUserById(id)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+	})
+	return
 }
 
-func updateUserRequestCount(id int, count int) {
-	err := DB.Model(&User{}).Where("id = ?", id).Update("request_count", gorm.Expr("request_count + ?", count)).Error
-	if err != nil {
-		logger.SysError("failed to update user request count: " + err.Error())
+func CreateUser(c *gin.Context) {
+	ctx := c.Request.Context()
+	var user model.User
+	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	if err != nil || user.Username == "" || user.Password == "" {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": i18n.Translate(c, "invalid_parameter"),
+		})
+		return
 	}
+	if err := common.Validate.Struct(&user); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": i18n.Translate(c, "invalid_input"),
+		})
+		return
+	}
+	if user.DisplayName == "" {
+		user.DisplayName = user.Username
+	}
+	myRole := c.GetInt("role")
+	if user.Role >= myRole {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "无法创建权限大于等于自己的用户",
+		})
+		return
+	}
+	// Even for admin users, we cannot fully trust them!
+	cleanUser := model.User{
+		Username:    user.Username,
+		Password:    user.Password,
+		DisplayName: user.DisplayName,
+	}
+	if err := cleanUser.Insert(ctx, 0); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+	})
+	return
 }
 
-func GetUsernameById(id int) (username string) {
-	DB.Model(&User{}).Where("id = ?", id).Select("username").Find(&username)
-	return username
+type ManageRequest struct {
+	Username string `json:"username"`
+	Action   string `json:"action"`
+}
+
+// ManageUser Only admin user can do this
+func ManageUser(c *gin.Context) {
+	var req ManageRequest
+	err := json.NewDecoder(c.Request.Body).Decode(&req)
+
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": i18n.Translate(c, "invalid_parameter"),
+		})
+		return
+	}
+	user := model.User{
+		Username: req.Username,
+	}
+	// Fill attributes
+	model.DB.Where(&user).First(&user)
+	if user.Id == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "用户不存在",
+		})
+		return
+	}
+	myRole := c.GetInt("role")
+	if myRole <= user.Role && myRole != model.RoleRootUser {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "无权更新同权限等级或更高权限等级的用户信息",
+		})
+		return
+	}
+	switch req.Action {
+	case "disable":
+		user.Status = model.UserStatusDisabled
+		if user.Role == model.RoleRootUser {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "无法禁用超级管理员用户",
+			})
+			return
+		}
+	case "enable":
+		user.Status = model.UserStatusEnabled
+	case "delete":
+		if user.Role == model.RoleRootUser {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "无法删除超级管理员用户",
+			})
+			return
+		}
+		if err := user.Delete(); err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+	case "promote":
+		if myRole != model.RoleRootUser {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "普通管理员用户无法提升其他用户为管理员",
+			})
+			return
+		}
+		if user.Role >= model.RoleAdminUser {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "该用户已经是管理员",
+			})
+			return
+		}
+		user.Role = model.RoleAdminUser
+	case "demote":
+		if user.Role == model.RoleRootUser {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "无法降级超级管理员用户",
+			})
+			return
+		}
+		if user.Role == model.RoleCommonUser {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "该用户已经是普通用户",
+			})
+			return
+		}
+		user.Role = model.RoleCommonUser
+	}
+
+	if err := user.Update(false); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	clearUser := model.User{
+		Role:   user.Role,
+		Status: user.Status,
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    clearUser,
+	})
+	return
+}
+
+func EmailBind(c *gin.Context) {
+	email := c.Query("email")
+	code := c.Query("code")
+	if !common.VerifyCodeWithKey(email, code, common.EmailVerificationPurpose) {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "验证码错误或已过期",
+		})
+		return
+	}
+	id := c.GetInt("id")
+	user := model.User{
+		Id: id,
+	}
+	err := user.FillUserById()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	user.Email = email
+	// no need to check if this email already taken, because we have used verification code to check it
+	err = user.Update(false)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	if user.Role == model.RoleRootUser {
+		config.RootUserEmail = email
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+	})
+	return
+}
+
+type topUpRequest struct {
+	Key string `json:"key"`
+}
+
+func TopUp(c *gin.Context) {
+	ctx := c.Request.Context()
+	req := topUpRequest{}
+	err := c.ShouldBindJSON(&req)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	id := c.GetInt("id")
+	quota, err := model.Redeem(ctx, req.Key, id)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    quota,
+	})
+	return
+}
+
+type adminTopUpRequest struct {
+	UserId int    `json:"user_id"`
+	Quota  int    `json:"quota"`
+	Remark string `json:"remark"`
+}
+
+func AdminTopUp(c *gin.Context) {
+	ctx := c.Request.Context()
+	req := adminTopUpRequest{}
+	err := c.ShouldBindJSON(&req)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	err = model.IncreaseUserQuota(req.UserId, int64(req.Quota))
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	if req.Remark == "" {
+		req.Remark = fmt.Sprintf("通过 API 充值 %s", common.LogQuota(int64(req.Quota)))
+	}
+	model.RecordTopupLog(ctx, req.UserId, req.Remark, req.Quota)
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+	})
+	return
 }

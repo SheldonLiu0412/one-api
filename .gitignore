@@ -12,3 +12,5 @@ cmd.md
 .env
 /one-api
 docker-compose.yml
+temp
+.DS_Store

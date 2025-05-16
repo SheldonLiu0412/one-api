@@ -71,7 +71,7 @@ func memoryRateLimiter(c *gin.Context, maxRequestNum int, duration int64, mark s
 }
 
 func rateLimitFactory(maxRequestNum int, duration int64, mark string) func(c *gin.Context) {
-	if maxRequestNum == 0 {
+	if maxRequestNum == 0 || config.DebugEnabled {
 		return func(c *gin.Context) {
 			c.Next()
 		}
