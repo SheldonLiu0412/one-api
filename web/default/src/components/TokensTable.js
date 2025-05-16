@@ -193,6 +193,7 @@ const TokensTable = () => {
       case 'ama':
         url = `ama://set-api-key?server=${encodedServerAddress}&key=sk-${key}`;
         break;
+
       case 'opencat':
         url = `opencat://team/join?domain=${encodedServerAddress}&token=sk-${key}`;
         break;

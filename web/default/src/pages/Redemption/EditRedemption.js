@@ -7,7 +7,10 @@ import { renderQuota, renderQuotaWithPrompt } from '../../helpers/render';
 
 const EditRedemption = () => {
   const { t } = useTranslation();
+  const params = useParams();
+  const navigate = useNavigate();
   const redemptionId = params.id;
+  const isEdit = redemptionId !== undefined;
   const [loading, setLoading] = useState(isEdit);
   const originInputs = {
     name: '',
@@ -20,6 +23,7 @@ const EditRedemption = () => {
   const handleCancel = () => {
     navigate('/redemption');
   };
+
   const handleInputChange = (e, { name, value }) => {
     setInputs((inputs) => ({ ...inputs, [name]: value }));
   };
